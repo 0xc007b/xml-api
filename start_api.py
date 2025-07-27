@@ -125,7 +125,7 @@ def main():
 
     # Import the app
     try:
-        from app_swagger import app
+        from app import app
     except ImportError as e:
         print(f"\n✗ Error importing app: {e}")
         sys.exit(1)
