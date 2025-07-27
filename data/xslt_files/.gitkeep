@@ -1,0 +1,2 @@
+# This file ensures the xslt_files directory is tracked by git
+# Actual XSLT files in this directory are ignored via .gitignore
