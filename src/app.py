@@ -1,12 +1,16 @@
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, jsonify
 from flask_restx import Api, Resource, fields, Namespace
 from flask_cors import CORS
+from flask_jwt_extended import JWTManager, jwt_required, create_access_token, get_jwt_identity
 from werkzeug.utils import secure_filename
 from werkzeug.datastructures import FileStorage
+from werkzeug.security import check_password_hash, generate_password_hash
+from functools import wraps
 import os
 import uuid
 from lxml import etree
 import json
+from datetime import timedelta
 
 app = Flask(__name__)
 CORS(app)
@@ -17,6 +21,13 @@ app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.dirname(__fil
 app.config['XSLT_FOLDER'] = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'xslt_files')
 app.config['RESTX_MASK_SWAGGER'] = False
 
+# JWT Configuration
+app.config['JWT_SECRET_KEY'] = 'your-secret-key-change-in-production'  # Change this in production!
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=1)
+
+# Initialize JWT
+jwt = JWTManager(app)
+
 # Ensure upload directories exist
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['XSLT_FOLDER'], exist_ok=True)
@@ -24,24 +35,53 @@ os.makedirs(app.config['XSLT_FOLDER'], exist_ok=True)
 # In-memory storage for XML files (in production, use a database)
 xml_storage = {}
 
+# Simple user storage (in production, use a proper database)
+users = {
+    'admin': {
+        'password': generate_password_hash('Usage8-Unnamed5-Flatly9-Seducing0-Nuclear8'),  # Change this in production!
+        'username': 'admin'
+    }
+}
+
 # Initialize Flask-RESTX
 api = Api(app,
     version='1.0.0',
     title='XML RESTful API',
     description='A comprehensive RESTful API for XML file manipulation with XSLT transformation capabilities',
     doc='/api/docs',
-    prefix='/api'
+    prefix='/api',
+    authorizations={
+        'Bearer': {
+            'type': 'apiKey',
+            'in': 'header',
+            'name': 'Authorization',
+            'description': 'Type in the value input box below: Bearer <JWT token>'
+        }
+    },
+    security='Bearer'
 )
 
 # Create namespaces
+auth_ns = Namespace('auth', description='Authentication operations')
 health_ns = Namespace('health', description='Health check operations')
 xml_ns = Namespace('xml', description='XML file operations')
 
 # Add namespaces to API
+api.add_namespace(auth_ns)
 api.add_namespace(health_ns)
 api.add_namespace(xml_ns)
 
 # Models for Swagger documentation
+login_model = api.model('Login', {
+    'username': fields.String(required=True, description='Username'),
+    'password': fields.String(required=True, description='Password')
+})
+
+token_response_model = api.model('TokenResponse', {
+    'access_token': fields.String(required=True, description='JWT access token'),
+    'expires_in': fields.Integer(required=True, description='Token expiration time in seconds')
+})
+
 health_model = api.model('Health', {
     'status': fields.String(required=True, description='Health status'),
     'service': fields.String(required=True, description='Service name'),
@@ -128,55 +168,86 @@ xpath_parser = api.parser()
 xpath_parser.add_argument('xpath', type=str, required=True, help='XPath expression', location='args')
 
 
+# Authentication endpoints
+@auth_ns.route('/login')
+class Login(Resource):
+    @auth_ns.expect(login_model)
+    @auth_ns.marshal_with(token_response_model, code=200)
+    @auth_ns.response(401, 'Invalid credentials', error_model)
+    @auth_ns.response(400, 'Bad request', error_model)
+    def post(self):
+        """Authenticate user and return JWT token"""
+        data = request.get_json()
+        if not data:
+            api.abort(400, error='Request body must be JSON')
+
+        username = data.get('username')
+        password = data.get('password')
+
+        if not username or not password:
+            api.abort(400, error='Username and password are required')
+
+        user = users.get(username)
+        if user and check_password_hash(user['password'], password):
+            access_token = create_access_token(identity=username)
+            return {
+                'access_token': access_token,
+                'expires_in': 3600  # 1 hour in seconds
+            }, 200
+        else:
+            api.abort(401, error='Invalid credentials')
+
+
 class XMLProcessor:
     """Class to handle XML processing operations"""
 
     @staticmethod
-    def validate_xml(xml_content):
-        """Validate if the content is valid XML"""
+    def validate_xml(file_path):
+        """Validate XML file"""
         try:
-            etree.fromstring(xml_content)
-            return True, None
+            etree.parse(file_path)
+            return True, "Valid XML"
         except etree.XMLSyntaxError as e:
             return False, str(e)
 
     @staticmethod
-    def parse_xml_file(filepath):
-        """Parse XML file and return the tree"""
+    def parse_xml_file(file_path):
+        """Parse XML file and return root element"""
         try:
-            parser = etree.XMLParser(remove_blank_text=True)
-            tree = etree.parse(filepath, parser)
+            tree = etree.parse(file_path)
             return tree, None
         except Exception as e:
             return None, str(e)
 
     @staticmethod
-    def transform_xml(xml_tree, xslt_filepath):
+    def transform_xml(xml_file_path, xslt_file_path):
         """Transform XML using XSLT"""
         try:
-            xslt_tree = etree.parse(xslt_filepath)
-            transform = etree.XSLT(xslt_tree)
-            result = transform(xml_tree)
+            xml_doc = etree.parse(xml_file_path)
+            xslt_doc = etree.parse(xslt_file_path)
+            transform = etree.XSLT(xslt_doc)
+            result = transform(xml_doc)
             return result, None
         except Exception as e:
             return None, str(e)
 
     @staticmethod
-    def get_element_by_xpath(xml_tree, xpath):
-        """Get elements using XPath"""
+    def get_element_by_xpath(tree, xpath):
+        """Get elements by XPath expression"""
         try:
-            elements = xml_tree.xpath(xpath)
+            elements = tree.xpath(xpath)
             return elements, None
         except Exception as e:
             return None, str(e)
 
 
-@health_ns.route('')
+@health_ns.route('/')
 class HealthCheck(Resource):
-    @api.doc('health_check')
-    @api.marshal_with(health_model)
+    @health_ns.marshal_with(health_model)
+    @health_ns.response(200, 'Success')
+    @jwt_required()
     def get(self):
-        """Check API health status"""
+        """Get API health status"""
         return {
             'status': 'healthy',
             'service': 'XML RESTful API',
@@ -186,71 +257,67 @@ class HealthCheck(Resource):
 
 @xml_ns.route('/upload')
 class XMLUpload(Resource):
-    @api.doc('upload_xml')
-    @api.expect(upload_parser)
-    @api.marshal_with(upload_response_model, code=201)
-    @api.response(400, 'Bad Request', error_model)
-    @api.response(413, 'File too large')
+    @xml_ns.expect(upload_parser)
+    @xml_ns.marshal_with(upload_response_model, code=201)
+    @xml_ns.response(400, 'Bad Request', error_model)
+    @xml_ns.response(413, 'File too large', error_model)
+    @jwt_required()
     def post(self):
-        """Upload an XML file"""
-        args = upload_parser.parse_args()
-        file = args['file']
-
-        if not file:
+        """Upload XML file"""
+        if 'file' not in request.files:
             api.abort(400, error='No file provided')
 
+        file = request.files['file']
         if file.filename == '':
             api.abort(400, error='No file selected')
 
-        if not file.filename.endswith('.xml'):
-            api.abort(400, error='File must be XML format')
+        if not file.filename.lower().endswith('.xml'):
+            api.abort(400, error='Only XML files are allowed')
 
         try:
-            # Read and validate XML content
-            xml_content = file.read()
-            is_valid, error = XMLProcessor.validate_xml(xml_content)
-
-            if not is_valid:
-                api.abort(400, error=f'Invalid XML: {error}')
-
-            # Generate unique ID and save file
+            # Generate unique file ID
             file_id = str(uuid.uuid4())
-            filename = secure_filename(f"{file_id}.xml")
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{file_id}_{filename}")
 
-            with open(filepath, 'wb') as f:
-                f.write(xml_content)
+            # Save file
+            file.save(file_path)
 
-            # Store metadata
+            # Validate XML
+            is_valid, message = XMLProcessor.validate_xml(file_path)
+            if not is_valid:
+                os.remove(file_path)
+                api.abort(400, error=f'Invalid XML: {message}')
+
+            # Store file info
             xml_storage[file_id] = {
-                'id': file_id,
-                'original_filename': file.filename,
-                'filepath': filepath,
-                'uploaded_at': str(uuid.uuid1().time)
+                'filename': filename,
+                'path': file_path,
+                'uploaded_at': str(uuid.uuid4())
             }
 
             return {
-                'message': 'XML file uploaded successfully',
+                'message': 'File uploaded successfully',
                 'file_id': file_id,
-                'filename': file.filename
+                'filename': filename
             }, 201
 
         except Exception as e:
             api.abort(500, error=str(e))
 
 
-@xml_ns.route('')
+@xml_ns.route('/')
 class XMLList(Resource):
-    @api.doc('list_xml_files')
-    @api.marshal_with(files_list_model)
+    @xml_ns.marshal_with(files_list_model)
+    @jwt_required()
     def get(self):
-        """List all uploaded XML files"""
+        """Get list of all uploaded XML files"""
         files = []
-        for file_id, metadata in xml_storage.items():
+        for file_id, info in xml_storage.items():
             files.append({
                 'id': file_id,
-                'filename': metadata['original_filename'],
-                'uploaded_at': metadata['uploaded_at']
+                'filename': info['filename'],
+                'uploaded_at': info['uploaded_at']
             })
 
         return {
@@ -260,36 +327,30 @@ class XMLList(Resource):
 
 
 @xml_ns.route('/<string:file_id>')
-@api.param('file_id', 'The file identifier')
 class XMLFile(Resource):
-    @api.doc('get_xml_file')
-    @api.produces(['application/xml'])
-    @api.response(404, 'File not found', error_model)
+    @xml_ns.response(200, 'File content')
+    @xml_ns.response(404, 'File not found', error_model)
+    @jwt_required()
     def get(self, file_id):
-        """Download an XML file"""
+        """Download XML file"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
-        try:
-            filepath = xml_storage[file_id]['filepath']
-            return send_file(filepath, mimetype='application/xml', as_attachment=True,
-                           download_name=xml_storage[file_id]['original_filename'])
-        except Exception as e:
-            api.abort(500, error=str(e))
+        file_info = xml_storage[file_id]
+        return send_file(file_info['path'], as_attachment=True, download_name=file_info['filename'])
 
-    @api.doc('delete_xml_file')
-    @api.marshal_with(delete_response_model)
-    @api.response(404, 'File not found', error_model)
+    @xml_ns.marshal_with(delete_response_model)
+    @xml_ns.response(404, 'File not found', error_model)
+    @jwt_required()
     def delete(self, file_id):
-        """Delete an XML file"""
+        """Delete XML file"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
         try:
-            filepath = xml_storage[file_id]['filepath']
-            if os.path.exists(filepath):
-                os.remove(filepath)
-
+            file_info = xml_storage[file_id]
+            if os.path.exists(file_info['path']):
+                os.remove(file_info['path'])
             del xml_storage[file_id]
 
             return {
@@ -302,157 +363,166 @@ class XMLFile(Resource):
 
 
 @xml_ns.route('/<string:file_id>/element')
-@api.param('file_id', 'The file identifier')
 class XMLElement(Resource):
-    @api.doc('get_xml_elements')
-    @api.expect(xpath_parser)
-    @api.marshal_with(elements_response_model)
-    @api.response(400, 'Bad Request', error_model)
-    @api.response(404, 'File not found', error_model)
+    @xml_ns.expect(xpath_parser)
+    @xml_ns.marshal_with(elements_response_model)
+    @xml_ns.response(404, 'File not found', error_model)
+    @xml_ns.response(400, 'Invalid XPath', error_model)
+    @jwt_required()
     def get(self, file_id):
         """Get XML elements by XPath"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
-        args = xpath_parser.parse_args()
-        xpath = args.get('xpath')
-
+        xpath = request.args.get('xpath')
         if not xpath:
-            api.abort(400, error='XPath parameter required')
+            api.abort(400, error='XPath parameter is required')
 
         try:
-            filepath = xml_storage[file_id]['filepath']
-            tree, error = XMLProcessor.parse_xml_file(filepath)
-
+            file_info = xml_storage[file_id]
+            tree, error = XMLProcessor.parse_xml_file(file_info['path'])
             if error:
-                api.abort(500, error=error)
+                api.abort(500, error=f'Error parsing XML: {error}')
 
             elements, error = XMLProcessor.get_element_by_xpath(tree, xpath)
             if error:
-                api.abort(400, error=error)
+                api.abort(400, error=f'Invalid XPath: {error}')
 
-            # Convert elements to string representation
-            result = []
+            # Format elements for response
+            formatted_elements = []
             for elem in elements:
-                result.append({
-                    'tag': elem.tag,
-                    'text': elem.text,
-                    'attributes': dict(elem.attrib),
-                    'xml': etree.tostring(elem, encoding='unicode', pretty_print=True)
-                })
+                if hasattr(elem, 'tag'):  # It's an element
+                    formatted_elements.append({
+                        'tag': elem.tag,
+                        'text': elem.text,
+                        'attributes': dict(elem.attrib),
+                        'xml': etree.tostring(elem, encoding='unicode', pretty_print=True)
+                    })
+                else:  # It's a text node or attribute
+                    formatted_elements.append({
+                        'tag': 'text',
+                        'text': str(elem),
+                        'attributes': {},
+                        'xml': str(elem)
+                    })
 
             return {
                 'file_id': file_id,
                 'xpath': xpath,
-                'count': len(result),
-                'elements': result
+                'count': len(formatted_elements),
+                'elements': formatted_elements
             }, 200
 
         except Exception as e:
             api.abort(500, error=str(e))
 
-    @api.doc('add_xml_element')
-    @api.expect(add_element_request)
-    @api.marshal_with(element_response_model, code=201)
-    @api.response(400, 'Bad Request', error_model)
-    @api.response(404, 'File not found', error_model)
+    @xml_ns.expect(add_element_request)
+    @xml_ns.marshal_with(element_response_model, code=201)
+    @xml_ns.response(404, 'File not found', error_model)
+    @xml_ns.response(400, 'Bad Request', error_model)
+    @jwt_required()
     def post(self, file_id):
-        """Add a new element to XML file"""
+        """Add new element to XML file"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
         data = request.get_json()
-        if not data:
-            api.abort(400, error='JSON data required')
+        parent_xpath = data.get('parent_xpath')
+        tag = data.get('tag')
+        text = data.get('text', '')
+        attributes = data.get('attributes', {})
 
-        required_fields = ['parent_xpath', 'tag']
-        for field in required_fields:
-            if field not in data:
-                api.abort(400, error=f'Missing required field: {field}')
+        if not parent_xpath or not tag:
+            api.abort(400, error='parent_xpath and tag are required')
 
         try:
-            filepath = xml_storage[file_id]['filepath']
-            tree, error = XMLProcessor.parse_xml_file(filepath)
-
+            file_info = xml_storage[file_id]
+            tree, error = XMLProcessor.parse_xml_file(file_info['path'])
             if error:
-                api.abort(500, error=error)
+                api.abort(500, error=f'Error parsing XML: {error}')
 
             # Find parent element
-            parents, error = XMLProcessor.get_element_by_xpath(tree, data['parent_xpath'])
-            if error or not parents:
-                api.abort(404, error='Parent element not found')
+            parents, error = XMLProcessor.get_element_by_xpath(tree, parent_xpath)
+            if error:
+                api.abort(400, error=f'Invalid parent XPath: {error}')
+            if not parents:
+                api.abort(400, error='Parent element not found')
 
+            # Add new element to first parent found
             parent = parents[0]
+            new_element = etree.SubElement(parent, tag)
 
-            # Create new element
-            new_elem = etree.SubElement(parent, data['tag'])
+            if text:
+                new_element.text = text
 
-            if 'text' in data:
-                new_elem.text = data['text']
+            for attr_name, attr_value in attributes.items():
+                new_element.set(attr_name, str(attr_value))
 
-            if 'attributes' in data and isinstance(data['attributes'], dict):
-                for key, value in data['attributes'].items():
-                    new_elem.set(key, str(value))
-
-            # Save the modified tree
-            tree.write(filepath, encoding='utf-8', xml_declaration=True, pretty_print=True)
+            # Save the modified XML
+            tree.write(file_info['path'], encoding='utf-8', xml_declaration=True, pretty_print=True)
 
             return {
                 'message': 'Element added successfully',
                 'file_id': file_id,
                 'element': {
-                    'tag': new_elem.tag,
-                    'text': new_elem.text,
-                    'attributes': dict(new_elem.attrib)
+                    'tag': new_element.tag,
+                    'text': new_element.text,
+                    'attributes': dict(new_element.attrib),
+                    'xml': etree.tostring(new_element, encoding='unicode', pretty_print=True)
                 }
             }, 201
 
         except Exception as e:
             api.abort(500, error=str(e))
 
-    @api.doc('update_xml_element')
-    @api.expect(update_element_request)
-    @api.marshal_with(element_response_model)
-    @api.response(400, 'Bad Request', error_model)
-    @api.response(404, 'Element not found', error_model)
+    @xml_ns.expect(update_element_request)
+    @xml_ns.marshal_with(element_response_model)
+    @xml_ns.response(404, 'File not found', error_model)
+    @xml_ns.response(400, 'Bad Request', error_model)
+    @jwt_required()
     def put(self, file_id):
-        """Update an XML element"""
+        """Update existing XML element"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
         data = request.get_json()
-        if not data or 'xpath' not in data:
-            api.abort(400, error='XPath required')
+        xpath = data.get('xpath')
+        text = data.get('text')
+        attributes = data.get('attributes', {})
+        clear_attributes = data.get('clear_attributes', False)
+
+        if not xpath:
+            api.abort(400, error='xpath is required')
 
         try:
-            filepath = xml_storage[file_id]['filepath']
-            tree, error = XMLProcessor.parse_xml_file(filepath)
-
+            file_info = xml_storage[file_id]
+            tree, error = XMLProcessor.parse_xml_file(file_info['path'])
             if error:
-                api.abort(500, error=error)
+                api.abort(500, error=f'Error parsing XML: {error}')
 
-            # Find element to update
-            elements, error = XMLProcessor.get_element_by_xpath(tree, data['xpath'])
-            if error or not elements:
+            # Find elements to update
+            elements, error = XMLProcessor.get_element_by_xpath(tree, xpath)
+            if error:
+                api.abort(400, error=f'Invalid XPath: {error}')
+            if not elements:
                 api.abort(404, error='Element not found')
 
+            # Update first element found
             element = elements[0]
 
-            # Update element
-            if 'text' in data:
-                element.text = data['text']
+            if text is not None:
+                element.text = text
 
-            if 'attributes' in data and isinstance(data['attributes'], dict):
-                # Clear existing attributes if requested
-                if data.get('clear_attributes', False):
-                    element.attrib.clear()
+            if clear_attributes:
+                element.clear()
+                if text is not None:
+                    element.text = text
 
-                # Set new attributes
-                for key, value in data['attributes'].items():
-                    element.set(key, str(value))
+            for attr_name, attr_value in attributes.items():
+                element.set(attr_name, str(attr_value))
 
-            # Save the modified tree
-            tree.write(filepath, encoding='utf-8', xml_declaration=True, pretty_print=True)
+            # Save the modified XML
+            tree.write(file_info['path'], encoding='utf-8', xml_declaration=True, pretty_print=True)
 
             return {
                 'message': 'Element updated successfully',
@@ -460,55 +530,54 @@ class XMLElement(Resource):
                 'element': {
                     'tag': element.tag,
                     'text': element.text,
-                    'attributes': dict(element.attrib)
+                    'attributes': dict(element.attrib),
+                    'xml': etree.tostring(element, encoding='unicode', pretty_print=True)
                 }
             }, 200
 
         except Exception as e:
             api.abort(500, error=str(e))
 
-    @api.doc('delete_xml_element')
-    @api.expect(xpath_parser)
-    @api.marshal_with(delete_response_model)
-    @api.response(400, 'Bad Request', error_model)
-    @api.response(404, 'Element not found', error_model)
+    @xml_ns.expect(xpath_parser)
+    @xml_ns.marshal_with(delete_response_model)
+    @xml_ns.response(404, 'File not found', error_model)
+    @xml_ns.response(400, 'Invalid XPath', error_model)
+    @jwt_required()
     def delete(self, file_id):
         """Delete XML elements by XPath"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
-        args = xpath_parser.parse_args()
-        xpath = args.get('xpath')
-
+        xpath = request.args.get('xpath')
         if not xpath:
-            api.abort(400, error='XPath parameter required')
+            api.abort(400, error='XPath parameter is required')
 
         try:
-            filepath = xml_storage[file_id]['filepath']
-            tree, error = XMLProcessor.parse_xml_file(filepath)
-
+            file_info = xml_storage[file_id]
+            tree, error = XMLProcessor.parse_xml_file(file_info['path'])
             if error:
-                api.abort(500, error=error)
+                api.abort(500, error=f'Error parsing XML: {error}')
 
             # Find elements to delete
             elements, error = XMLProcessor.get_element_by_xpath(tree, xpath)
-            if error or not elements:
-                api.abort(404, error='Element not found')
+            if error:
+                api.abort(400, error=f'Invalid XPath: {error}')
 
-            count = 0
+            deleted_count = 0
             for element in elements:
-                parent = element.getparent()
-                if parent is not None:
-                    parent.remove(element)
-                    count += 1
+                if hasattr(element, 'getparent'):
+                    parent = element.getparent()
+                    if parent is not None:
+                        parent.remove(element)
+                        deleted_count += 1
 
-            # Save the modified tree
-            tree.write(filepath, encoding='utf-8', xml_declaration=True, pretty_print=True)
+            # Save the modified XML
+            tree.write(file_info['path'], encoding='utf-8', xml_declaration=True, pretty_print=True)
 
             return {
-                'message': 'Elements deleted successfully',
+                'message': f'Deleted {deleted_count} elements',
                 'file_id': file_id,
-                'deleted_count': count
+                'deleted_count': deleted_count
             }, 200
 
         except Exception as e:
@@ -516,65 +585,53 @@ class XMLElement(Resource):
 
 
 @xml_ns.route('/<string:file_id>/transform')
-@api.param('file_id', 'The file identifier')
 class XMLTransform(Resource):
-    @api.doc('transform_xml')
-    @api.expect(transform_parser)
-    @api.marshal_with(transform_response_model)
-    @api.response(400, 'Bad Request', error_model)
-    @api.response(404, 'File not found', error_model)
+    @xml_ns.expect(transform_parser)
+    @xml_ns.marshal_with(transform_response_model)
+    @xml_ns.response(404, 'File not found', error_model)
+    @xml_ns.response(400, 'Bad Request', error_model)
+    @jwt_required()
     def post(self, file_id):
         """Transform XML file using XSLT"""
         if file_id not in xml_storage:
             api.abort(404, error='File not found')
 
-        args = transform_parser.parse_args()
-        xslt_file = args['xslt']
+        if 'xslt' not in request.files:
+            api.abort(400, error='No XSLT file provided')
 
-        if not xslt_file:
-            api.abort(400, error='XSLT file required')
-
-        if not xslt_file.filename.endswith('.xsl') and not xslt_file.filename.endswith('.xslt'):
-            api.abort(400, error='File must be XSL/XSLT format')
+        xslt_file = request.files['xslt']
+        if xslt_file.filename == '':
+            api.abort(400, error='No XSLT file selected')
 
         try:
             # Save XSLT file temporarily
-            xslt_id = str(uuid.uuid4())
-            xslt_filename = secure_filename(f"{xslt_id}.xsl")
-            xslt_filepath = os.path.join(app.config['XSLT_FOLDER'], xslt_filename)
-            xslt_file.save(xslt_filepath)
-
-            # Parse XML file
-            xml_filepath = xml_storage[file_id]['filepath']
-            xml_tree, error = XMLProcessor.parse_xml_file(xml_filepath)
-
-            if error:
-                os.remove(xslt_filepath)
-                api.abort(500, error=f'XML parsing error: {error}')
+            xslt_filename = secure_filename(xslt_file.filename)
+            xslt_path = os.path.join(app.config['XSLT_FOLDER'], f"temp_{uuid.uuid4()}_{xslt_filename}")
+            xslt_file.save(xslt_path)
 
             # Transform XML
-            result_tree, error = XMLProcessor.transform_xml(xml_tree, xslt_filepath)
+            file_info = xml_storage[file_id]
+            result, error = XMLProcessor.transform_xml(file_info['path'], xslt_path)
 
-            # Clean up XSLT file
-            os.remove(xslt_filepath)
+            # Clean up temporary XSLT file
+            os.remove(xslt_path)
 
             if error:
-                api.abort(500, error=f'Transformation error: {error}')
+                api.abort(400, error=f'Transformation error: {error}')
 
             # Save transformed result
             result_id = str(uuid.uuid4())
-            result_filename = f"{result_id}_transformed.xml"
-            result_filepath = os.path.join(app.config['UPLOAD_FOLDER'], result_filename)
+            result_filename = f"transformed_{file_info['filename']}"
+            result_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{result_id}_{result_filename}")
 
-            result_tree.write(result_filepath, encoding='utf-8', xml_declaration=True, pretty_print=True)
+            with open(result_path, 'w', encoding='utf-8') as f:
+                f.write(str(result))
 
-            # Store metadata
+            # Store transformed file info
             xml_storage[result_id] = {
-                'id': result_id,
-                'original_filename': f"transformed_{xml_storage[file_id]['original_filename']}",
-                'filepath': result_filepath,
-                'uploaded_at': str(uuid.uuid1().time),
-                'transformed_from': file_id
+                'filename': result_filename,
+                'path': result_path,
+                'uploaded_at': str(uuid.uuid4())
             }
 
             return {
