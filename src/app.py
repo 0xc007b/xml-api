@@ -13,7 +13,7 @@ import json
 from datetime import timedelta
 
 app = Flask(__name__)
-CORS(app)
+# CORS(app)
 
 # Configuration
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
@@ -38,7 +38,7 @@ xml_storage = {}
 # Simple user storage (in production, use a proper database)
 users = {
     'admin': {
-        'password': generate_password_hash('Usage8-Unnamed5-Flatly9-Seducing0-Nuclear8'),  # Change this in production!
+        'password': generate_password_hash('Usage8-Unnamed5-Flatly9-Seducing0-Nuclear8'), 
         'username': 'admin'
     }
 }
@@ -458,6 +458,9 @@ class XMLElement(Resource):
             for attr_name, attr_value in attributes.items():
                 new_element.set(attr_name, str(attr_value))
 
+            # Reformat the entire XML to maintain proper indentation
+            etree.indent(tree, space="  ")
+            
             # Save the modified XML
             tree.write(file_info['path'], encoding='utf-8', xml_declaration=True, pretty_print=True)
 
@@ -521,6 +524,9 @@ class XMLElement(Resource):
             for attr_name, attr_value in attributes.items():
                 element.set(attr_name, str(attr_value))
 
+            # Reformat the entire XML to maintain proper indentation
+            etree.indent(tree, space="  ")
+
             # Save the modified XML
             tree.write(file_info['path'], encoding='utf-8', xml_declaration=True, pretty_print=True)
 
@@ -571,6 +577,9 @@ class XMLElement(Resource):
                         parent.remove(element)
                         deleted_count += 1
 
+            # Reformat the entire XML to maintain proper indentation
+            etree.indent(tree, space="  ")
+
             # Save the modified XML
             tree.write(file_info['path'], encoding='utf-8', xml_declaration=True, pretty_print=True)
 
@@ -619,9 +628,11 @@ class XMLTransform(Resource):
             if error:
                 api.abort(400, error=f'Transformation error: {error}')
 
-            # Save transformed result
+            # Save transformed result as HTML
             result_id = str(uuid.uuid4())
-            result_filename = f"transformed_{file_info['filename']}"
+            # Change extension to .html for better display
+            base_filename = os.path.splitext(file_info['filename'])[0]
+            result_filename = f"transformed_{base_filename}.html"
             result_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{result_id}_{result_filename}")
 
             with open(result_path, 'w', encoding='utf-8') as f:
