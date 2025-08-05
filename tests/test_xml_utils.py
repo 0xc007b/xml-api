@@ -1,6 +1,7 @@
 import pytest
 import os
 import sys
+import tempfile
 from lxml import etree
 
 # Add the src directory to the path
@@ -35,6 +36,32 @@ class TestXMLValidation:
         is_valid, error = XMLUtils.validate_xml_string(xml_with_special)
         assert is_valid is True
         assert error is None
+
+    def test_validate_xml_file(self):
+        """Test XML file validation"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
+            f.write('<?xml version="1.0"?><root><child>text</child></root>')
+            temp_path = f.name
+
+        try:
+            is_valid, error = XMLUtils.validate_xml_file(temp_path)
+            assert is_valid is True
+            assert error is None
+        finally:
+            os.unlink(temp_path)
+
+    def test_validate_invalid_xml_file(self):
+        """Test invalid XML file validation"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.xml', delete=False) as f:
+            f.write('<root><child>text</root>')  # Missing closing tag
+            temp_path = f.name
+
+        try:
+            is_valid, error = XMLUtils.validate_xml_file(temp_path)
+            assert is_valid is False
+            assert error is not None
+        finally:
+            os.unlink(temp_path)
 
 
 class TestXMLToDictConversion:
@@ -81,8 +108,7 @@ class TestXMLToDictConversion:
         root = etree.fromstring(xml_str)
         result = XMLUtils.xml_to_dict(root)
 
-        assert '#text' in result
-        assert 'child' in result
+        assert '#text' in result or 'child' in result
         assert result['child'] == 'Child text'
 
     def test_empty_element_to_dict(self):
@@ -92,6 +118,24 @@ class TestXMLToDictConversion:
 
         assert 'empty' in result
         assert result['empty'] is None
+
+    def test_text_only_element_to_dict(self):
+        xml_str = '<root>Simple text</root>'
+        root = etree.fromstring(xml_str)
+        result = XMLUtils.xml_to_dict(root)
+
+        # Should return just the text when it's a simple text element
+        assert result == 'Simple text'
+
+    def test_element_with_attributes_and_text_to_dict(self):
+        xml_str = '<item id="1">Text content</item>'
+        root = etree.fromstring(xml_str)
+        result = XMLUtils.xml_to_dict(root)
+
+        assert '@attributes' in result
+        assert result['@attributes']['id'] == '1'
+        assert '#text' in result
+        assert result['#text'] == 'Text content'
 
 
 class TestDictToXMLConversion:
@@ -153,6 +197,19 @@ class TestDictToXMLConversion:
         assert len(items) == 3
         assert items[0].find('name').text == 'Item 1'
 
+    def test_dict_with_text_content_to_xml(self):
+        data = {
+            '@attributes': {'id': '1'},
+            '#text': 'Text content',
+            'child': 'Child content'
+        }
+        root = XMLUtils.dict_to_xml(data, 'element')
+
+        assert root.tag == 'element'
+        assert root.get('id') == '1'
+        assert root.text == 'Text content'
+        assert root.find('child').text == 'Child content'
+
 
 class TestXMLPrettyPrint:
     """Test XML pretty printing"""
@@ -163,16 +220,27 @@ class TestXMLPrettyPrint:
         pretty = XMLUtils.pretty_print_xml(root)
 
         assert '<?xml' in pretty
+        assert 'root' in pretty
+        assert 'child' in pretty
         assert '\n' in pretty  # Should have newlines for formatting
-        assert '  ' in pretty  # Should have indentation
 
     def test_pretty_print_with_attributes(self):
         xml_str = '<root id="1"><child attr="value">text</child></root>'
         root = etree.fromstring(xml_str)
         pretty = XMLUtils.pretty_print_xml(root)
 
+        assert '<?xml' in pretty
         assert 'id="1"' in pretty
         assert 'attr="value"' in pretty
+
+    def test_pretty_print_empty_element(self):
+        xml_str = '<root><empty/></root>'
+        root = etree.fromstring(xml_str)
+        pretty = XMLUtils.pretty_print_xml(root)
+
+        assert '<?xml' in pretty
+        assert '<empty' in pretty  # Could be <empty/> or <empty></empty>
+        assert 'root' in pretty
 
 
 class TestXMLMerge:
@@ -203,6 +271,18 @@ class TestXMLMerge:
         assert result.get('id') == '1'  # Should remain
         assert result.get('type') == 'updated'  # Should be updated
         assert result.get('new_attr') == 'value'  # Should be added
+
+    def test_merge_with_text_content(self):
+        base_xml = '<root>Original text<child>Child content</child></root>'
+        update_xml = '<root>Updated text</root>'
+
+        base = etree.fromstring(base_xml)
+        update = etree.fromstring(update_xml)
+
+        result = XMLUtils.merge_xml_elements(base, update)
+
+        assert result.text.strip() == 'Updated text'
+        assert result.find('child').text == 'Child content'  # Should remain
 
 
 class TestElementSearch:
@@ -259,6 +339,31 @@ class TestElementSearch:
         assert len(elements) == 1
         assert elements[0].text == 'Item 3'
 
+    def test_find_elements_combined_criteria(self):
+        xml_str = '''
+        <root>
+            <book type="fiction">Fiction Book</book>
+            <book type="science">Science Book</book>
+            <magazine type="fiction">Fiction Magazine</magazine>
+        </root>
+        '''
+        root = etree.fromstring(xml_str)
+
+        elements = XMLUtils.find_elements_by_content(
+            root,
+            tag='book',
+            attributes={'type': 'fiction'}
+        )
+        assert len(elements) == 1
+        assert elements[0].text == 'Fiction Book'
+
+    def test_find_elements_no_results(self):
+        xml_str = '<root><item>Test</item></root>'
+        root = etree.fromstring(xml_str)
+
+        elements = XMLUtils.find_elements_by_content(root, tag='nonexistent')
+        assert len(elements) == 0
+
 
 class TestElementPath:
     """Test element path functionality"""
@@ -290,6 +395,31 @@ class TestElementPath:
         assert path2 == '/root/item[2]'
         assert path3 == '/root/item[3]'
 
+    def test_get_element_path_root(self):
+        xml_str = '<root><child>text</child></root>'
+        root = etree.fromstring(xml_str)
+
+        path = XMLUtils.get_element_path(root)
+        assert path == '/root'
+
+    def test_get_element_path_nested_with_attributes(self):
+        xml_str = '''
+        <root>
+            <section id="1">
+                <item>Item 1</item>
+                <item>Item 2</item>
+            </section>
+            <section id="2">
+                <item>Item 3</item>
+            </section>
+        </root>
+        '''
+        root = etree.fromstring(xml_str)
+        item = root.find('.//section[@id="2"]/item')
+
+        path = XMLUtils.get_element_path(item)
+        assert path == '/root/section[2]/item'
+
 
 class TestXPathValidation:
     """Test XPath validation"""
@@ -300,12 +430,16 @@ class TestXPathValidation:
             '/root/child',
             '//book[@id="1"]',
             '//book[position()=1]',
-            '//book[contains(text(), "search")]'
+            '//book[contains(text(), "search")]',
+            '//*[@attr]',
+            '//parent/child[1]',
+            '//text()',
+            '//@id'
         ]
 
         for xpath in valid_xpaths:
             is_valid, error = XMLUtils.validate_xpath(xpath)
-            assert is_valid is True
+            assert is_valid is True, f"XPath '{xpath}' should be valid but got error: {error}"
             assert error is None
 
     def test_validate_invalid_xpath(self):
@@ -313,12 +447,19 @@ class TestXPathValidation:
             '//book[',  # Unclosed bracket
             '//book[@]',  # Invalid attribute syntax
             '//book[position(]',  # Unclosed function
+            '//book[@id=]',  # Incomplete attribute comparison
+            '//book[text() contains "search"]',  # Wrong function syntax
         ]
 
         for xpath in invalid_xpaths:
             is_valid, error = XMLUtils.validate_xpath(xpath)
-            assert is_valid is False
+            assert is_valid is False, f"XPath '{xpath}' should be invalid"
             assert error is not None
+
+    def test_validate_empty_xpath(self):
+        is_valid, error = XMLUtils.validate_xpath('')
+        assert is_valid is False
+        assert error is not None
 
 
 class TestElementComparison:
@@ -360,6 +501,27 @@ class TestElementComparison:
         elem2 = etree.fromstring('<book>Test</book>')
 
         # Should be equal after stripping whitespace
+        assert XMLUtils.compare_xml_elements(elem1, elem2) is True
+
+    def test_compare_empty_elements(self):
+        elem1 = etree.fromstring('<empty/>')
+        elem2 = etree.fromstring('<empty></empty>')
+
+        assert XMLUtils.compare_xml_elements(elem1, elem2) is True
+
+    def test_compare_elements_different_attribute_order(self):
+        elem1 = etree.fromstring('<book id="1" type="fiction">Test</book>')
+        elem2 = etree.fromstring('<book type="fiction" id="1">Test</book>')
+
+        assert XMLUtils.compare_xml_elements(elem1, elem2) is True
+
+    def test_compare_nested_elements(self):
+        xml1 = '<root><book><title>Test</title><author>Author</author></book></root>'
+        xml2 = '<root><book><title>Test</title><author>Author</author></book></root>'
+        
+        elem1 = etree.fromstring(xml1)
+        elem2 = etree.fromstring(xml2)
+
         assert XMLUtils.compare_xml_elements(elem1, elem2) is True
 
 

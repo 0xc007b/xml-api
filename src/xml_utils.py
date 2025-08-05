@@ -156,12 +156,13 @@ class XMLUtils:
         Returns:
             Pretty printed XML string
         """
-        return etree.tostring(
+        result = etree.tostring(
             element,
             encoding='unicode',
-            pretty_print=True,
-            xml_declaration=True
+            pretty_print=True
         )
+        # Add XML declaration manually
+        return '<?xml version="1.0" encoding="UTF-8"?>\n' + result
 
     @staticmethod
     def merge_xml_elements(base: etree.Element, update: etree.Element) -> etree.Element:
